@@ -104,8 +104,17 @@ class QuotaEnforcer:
         # 最近一次已知窗口计数：键为 (租户, 接口, 窗口编号)
         self._last_known: dict[tuple[str, str, int], int] = {}
 
-    def check_and_consume(self, tenant_id: str, api: str) -> None:
-        """消耗一个配额；耗尽 -> QUOTA_EXHAUSTED；依赖异常 -> 按降级策略。"""
+    def check_and_consume(
+        self,
+        tenant_id: str,
+        api: str,
+        degrade_override: DegradeMode | None = None,
+    ) -> None:
+        """消耗一个配额；耗尽 -> QUOTA_EXHAUSTED；依赖异常 -> 按降级策略。
+
+        ``degrade_override`` 来自请求处理开始时读取的写入策略快照，
+        保证一次请求（及其并发批次）使用同一个降级模式。
+        """
         rule = self._config.quota_limit(tenant_id, api)
         if rule is None:
             logger.info(
@@ -120,7 +129,10 @@ class QuotaEnforcer:
                 tenant_id, api, window_seconds, limit
             )
         except StoreUnavailable as exc:
-            self._degrade_decide(tenant_id, api, limit, window, exc)
+            self._degrade_decide(
+                tenant_id, api, limit, window, exc,
+                degrade_override or self._degrade,
+            )
             return
         with self._cache_lock:
             self._last_known[(tenant_id, api, window)] = used
@@ -148,8 +160,9 @@ class QuotaEnforcer:
         limit: int,
         window: int,
         exc: StoreUnavailable,
+        mode: DegradeMode | None = None,
     ) -> None:
-        mode = self._degrade
+        mode = mode or self._degrade
         if mode is DegradeMode.FAIL_OPEN:
             logger.warning(
                 "tenant=%s api=%s decision=allow basis=degrade_fail_open error=%s",

@@ -18,6 +18,9 @@ class DenyReason(str, Enum):
     QUOTA_EXHAUSTED = "quota_exhausted"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    IDEMPOTENCY_KEY_REQUIRED = "idempotency_key_required"
+    RESULT_EXPIRED = "result_expired"
+    RESULT_UNVERIFIABLE = "result_unverifiable"
 
 
 class GovernanceError(Exception):
