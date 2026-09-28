@@ -17,7 +17,11 @@ import threading
 import time
 from typing import Callable, Protocol
 
-from governance.config import DegradeMode, GovernanceConfig
+from governance.config import (
+    DegradeMode,
+    GovernanceConfig,
+    PolicyRegistry,
+)
 from governance.errors import DenyReason, GovernanceError
 
 logger = logging.getLogger("governance.quota")
@@ -87,26 +91,50 @@ class FailingQuotaStore:
 
 
 class QuotaEnforcer:
-    """配额判定器：封装配额查询与依赖异常时的降级裁决。"""
+    """配额判定器：封装配额查询与依赖异常时的降级裁决。
+
+    ``provider`` 既可传入静态 ``GovernanceConfig``，也可传入可热更新的
+    ``PolicyRegistry``；请求可显式传入本次判定专用的不可变 ``snapshot``，
+    以保证同一次请求 / 同一批并发请求按同一策略版本裁决。
+    """
 
     def __init__(
         self,
-        config: GovernanceConfig,
+        provider: GovernanceConfig | PolicyRegistry,
         store: QuotaStore,
         degrade_mode: DegradeMode | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self._config = config
+        self._provider = provider
         self._store = store
-        self._degrade = degrade_mode or config.degrade_mode
+        # 构造期显式覆盖（测试或临时固定模式用）；None 表示按配置逐请求解析。
+        self._override_degrade = degrade_mode
         self._clock = clock
         self._cache_lock = threading.Lock()
         # 最近一次已知窗口计数：键为 (租户, 接口, 窗口编号)
         self._last_known: dict[tuple[str, str, int], int] = {}
 
-    def check_and_consume(self, tenant_id: str, api: str) -> None:
+    def _snapshot(self, snapshot: GovernanceConfig | None) -> GovernanceConfig:
+        if snapshot is not None:
+            return snapshot
+        provider = self._provider
+        if isinstance(provider, PolicyRegistry):
+            return provider.get()
+        return provider
+
+    def reset_cache(self) -> None:
+        with self._cache_lock:
+            self._last_known.clear()
+
+    def check_and_consume(
+        self,
+        tenant_id: str,
+        api: str,
+        snapshot: GovernanceConfig | None = None,
+    ) -> None:
         """消耗一个配额；耗尽 -> QUOTA_EXHAUSTED；依赖异常 -> 按降级策略。"""
-        rule = self._config.quota_limit(tenant_id, api)
+        config = self._snapshot(snapshot)
+        rule = config.quota_limit(tenant_id, api)
         if rule is None:
             logger.info(
                 "tenant=%s api=%s quota=unlimited decision=allow basis=no_quota_rule",
@@ -120,7 +148,11 @@ class QuotaEnforcer:
                 tenant_id, api, window_seconds, limit
             )
         except StoreUnavailable as exc:
-            self._degrade_decide(tenant_id, api, limit, window, exc)
+            degrade = (
+                self._override_degrade
+                or config.write_policy(tenant_id, api).degrade_mode
+            )
+            self._degrade_decide(tenant_id, api, limit, window, exc, degrade)
             return
         with self._cache_lock:
             self._last_known[(tenant_id, api, window)] = used
@@ -148,8 +180,8 @@ class QuotaEnforcer:
         limit: int,
         window: int,
         exc: StoreUnavailable,
+        mode: DegradeMode,
     ) -> None:
-        mode = self._degrade
         if mode is DegradeMode.FAIL_OPEN:
             logger.warning(
                 "tenant=%s api=%s decision=allow basis=degrade_fail_open error=%s",

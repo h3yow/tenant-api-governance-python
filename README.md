@@ -1,143 +1,222 @@
-# 多租户 API 配额、幂等与降级治理
+# 多租户 API 配额、幂等、重试结算与降级治理
 
-面向多租户写 API 的治理层，让以下三类场景的行为 **可预期、可解释**：
+面向多租户写 API 的治理层，让以下场景的行为 **可预期、可解释**：
 
 - 并发请求：配额不会超卖、计数不会错乱；
-- 重复提交：同一幂等键只产生一次业务副作用，返回一致结论；
-- 依赖异常 / 时间窗口切换：按可配置策略确定性降级，底层错误不透出给调用方。
+- 重复提交 / 断线重连 / 重试风暴：同一提交标识只产生一次业务副作用，
+  永远返回首次结论，且 **重试不再占额度**（即使额度已耗尽或已跨时间窗口）；
+- 依赖异常 / 策略调整：降级策略可按租户×接口配置并热更新，并发下裁决一致，
+  底层错误不透出给调用方；
+- 结论可查询、可淘汰：依赖恢复后可凭提交标识只读查询处理结论；结论保留有
+  时长与容量上限，过期/被淘汰的旧标识被明确拒绝，绝不静默二次执行。
 
 ## 1. 模块结构
 
 ```
 governance/
   errors.py       # 统一拒绝原因 DenyReason 与 GovernanceError
-  config.py       # 配额规则 QuotaRule、降级策略 DegradeMode、总配置
+  config.py       # 配额/写入策略/保留策略 + PolicyRegistry 原子热更新
   identity.py     # 凭据 -> 租户身份 + 权限边界（允许的接口集合）
   quota.py        # 租户×接口×固定窗口计数；存储协议 + 内存实现 + 降级裁决
-  idempotency.py  # 幂等键占位/等待/落定；载荷一致性校验；存储协议+内存实现
-  middleware.py   # 判定链编排：身份 -> 权限 -> 配额 -> 幂等执行业务
-main.py           # FastAPI 示例：订单接口 + 拒绝原因到 HTTP 状态码映射
-tests/            # 35 个单测/集成测试（并发、跨窗口、依赖故障）
+  idempotency.py  # 结算存储：占位/等待/落定、TTL+LRU 保留、墓碑、只读查询
+  middleware.py   # 判定链编排：身份 -> 权限 -> 策略快照 -> 结算（内含配额）
+main.py           # FastAPI 示例：订单/支付接口 + 提交结论查询 + HTTP 映射
+tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故障、过期淘汰）
 ```
 
 ## 2. 判定链（顺序确定）
 
 1. **身份解析**：缺少凭据或凭据无法识别 → `missing_identity`（HTTP 401）。
-2. **权限校验**：身份已解析但请求的接口不在其权限边界内 → `access_denied`（403）。
-3. **配额消耗**：见第 3 节，耗尽 → `quota_exhausted`（429）；存储故障 → 按降级策略裁决。
-4. **幂等执行**：见第 4 节，载荷冲突 → `idempotency_conflict`（409）；存储不可用 → `dependency_unavailable`（503）。
+2. **权限校验**：接口不在其权限边界内 → `access_denied`（403）。
+3. **取策略快照**：整次请求只用同一份不可变配置（写入策略、额度、降级模式），
+   因此并发请求不会一半走旧策略、一半走新策略（见第 6 节）。
+4. **结算执行**：
+   - 要求标识的接口缺标识 → `missing_idempotency_key`（**428**，与其它失败区分）；
+   - 同标识重试/并发/断线重连 → 回放首次结论，**不占额度、不产生副作用**；
+   - 仅真正第一次出现的写请求才占用配额：耗尽 → `quota_exhausted`（429），
+     全新的提交标识在额度用完时仍照常被拒绝；
+   - 同键不同载荷 → `idempotency_conflict`（409）；
+   - 结论已过期/被淘汰 → `result_expired`（**410**），要求换新标识；
+   - 结算存储故障 / 副作用已发生但结论无法确认 → `dependency_unavailable`（503）。
 
-所有底层依赖异常都在治理层被翻译成上述可区分原因，调用方永远不会看到
-`connection refused` 之类的原始错误。
+## 3. 重试结算语义（与旧版本的关键差异）
 
-## 3. 配额模型
+> ⚠️ **行为变更**：旧版本中“幂等重放请求仍占用调用额度”。新版本中
+> **只有真正第一次出现的写请求占用额度**；重复提交、并发重试、断线重连
+> 一律回放首次结论，不再消耗任何额度。
 
-- **双维度约束**：配额键为 `(租户, 接口, 窗口编号)`。不同租户互不串账，
-  同一租户对不同接口各自独立计额；未配置规则的接口不限制。
-- **固定时间窗口**：窗口编号 = `epoch // window_seconds`。窗口切换后计数
-  自动从 0 开始（由 `tests/test_quota.py::test_quota_resets_at_window_boundary`
-  覆盖），不依赖惰性过期，因此窗口边界处行为确定。
-- **原子占用、拒绝不计**：`try_acquire` 在存储锁内完成 "判余量 → 递增"，
-  并发下放行数严格等于额度（200 并发 / 50 额度的测试验证绝不超卖）；
-  被拒绝的请求不递增，不虚耗配额。
-- 时钟通过 `clock` 注入，测试可以精确控制窗口边界。
+- **额度耗尽后的重试**：首次请求已落定，之后即使该租户该接口额度已经用完，
+  同标识重试仍返回首次结论（而不是 429）；但 **全新的提交标识** 仍被 429
+  正常拒绝。
+- **跨时间窗口的重试**：首次提交与重试落在不同窗口时，重试回放首次结论，
+  **不占用新窗口的额度**；新窗口额度完整保留给真正的新请求。
+- **并发重复提交**：后到者在同键条件变量上等待，首请求落定后拿到同一个返回值，
+  业务副作用严格一次（16 线程并发测试验证：副作用次数 = 1，结论完全一致）。
+- **同键不同载荷**：规范化 JSON + SHA-256 比对，哈希不同立即
+  `idempotency_conflict`，不会静默回放，也不会因为额度/窗口变化而改变结论；
+  JSON 键顺序不同但语义相同视为同一载荷（回放）。
+- **首次业务失败**：leader 标记 FAILED 并释放占位（无副作用），调用方可用
+  同一键安全重试，重试成为新的 leader 并正常占额度。
+- **配额闸门在结算之后**：leader 占位成功后才调用配额占用；若占额度被拒，
+  占位立即释放，调用方稍后可用同一键重试。
 
-## 4. 幂等规则
+## 4. 无标识写入（X-Idempotency-Key 缺失）
 
-写请求通过请求头 `X-Idempotency-Key` 携带幂等键（配合规范化后的载荷哈希）：
+- 默认接口：未携带提交标识时按普通请求执行——先占额度再产生副作用，**不做
+  结算保护**，重复提交的风险由调用方承担（与旧版本一致）。
+- **强制标识接口**：对不能接受重复副作用的接口，可按租户×接口配置
+  `require_idempotency_key=True`。缺失标识时返回独立的
+  `missing_idempotency_key`（HTTP **428 Precondition Required**），与额度、
+  冲突、依赖故障等失败明确区分；该拒绝不产生副作用、不占额度。
 
-- **首次提交（leader）**：占位（INFLIGHT）→ 执行业务 → 落定结果（COMPLETED）。
-- **完成后重复提交**：直接回放首请求结果，业务动作不再执行。
-- **并发重复提交**：后到者在同键的条件变量上等待，首请求落定后拿到
-  *同一个* 返回值。测试用 16 线程并发验证：副作用次数 = 1，16 份结论完全一致。
-- **同键不同载荷**：载荷做规范化 JSON + SHA-256 比较；哈希不同立即返回
-  `idempotency_conflict`，**不会静默以先到者为准**。JSON 键顺序不同但
-  语义相同视为同一载荷（回放，不算冲突）。
-- **业务失败**：leader 标记 FAILED 并释放占位，调用方可用同一键安全重试，
-  不会留下半成品状态。
-- **未携带幂等键**：按普通请求执行，不做幂等保护（调用方自行承担重复风险）。
+## 5. 配额模型与保留规则
 
-> 注意：幂等重放请求仍会经过身份/权限/配额检查。即"重复提交不再产生业务
-> 副作用"，但仍占用该租户该接口的调用额度（重复点击本身也是调用量）。
+### 5.1 配额
 
-## 5. 降级策略
+- 配额键为 `(租户, 接口, 窗口编号)`，租户/接口互不串账；未配置规则则不限。
+- 固定窗口编号 = `epoch // window_seconds`，窗口切换自动归零，边界行为确定。
+- “判余量 → 递增”在存储锁内原子完成：200 并发 / 50 额度绝不超卖；被拒请求
+  不递增、不虚耗。时钟可注入，测试可精确控制窗口边界。
 
-配额存储在 `increment` 时发生故障（连接失败、超时、等待落定超时等），
-由 `DegradeMode` 配置统一裁决，并发下策略一致：
+### 5.2 结论保留与淘汰（`RetentionConfig`）
 
-| 策略 | 行为 | 适用场景 |
+| 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
-| `FAIL_CLOSED`（默认） | 拒绝，返回 `dependency_unavailable` (503) | 安全优先，避免故障期超卖 |
-| `FAIL_OPEN` | 放行配额闸门 | 可用性优先；幂等保护仍然生效，副作用仍只一次 |
-| `USE_CACHE` | 用最近一次已知窗口计数判断：未达上限放行，已达上限或冷缓存未知则拒绝 | 可容忍轻微滞后 |
+| `result_ttl_seconds` | `86400`（24h） | 已完成结论的保留时长；`None` 表示不按时间过期 |
+| `max_completed_records` | `10000` | 每租户已完成结论容量上限；超出按 LRU 淘汰；`None` 表示不限 |
+| `tombstone_ttl_seconds` | `86400`（24h） | 过期/被淘汰标识以“墓碑”继续挡住静默重放的时长 |
 
-幂等存储故障（无法占位或无法确认首请求结论）**一律保守拒绝**为
-`dependency_unavailable`，因为无法确认状态时放行写请求可能导致重复副作用。
+规则与保证：
 
-## 6. 失败原因与 HTTP 映射
+- **超期或被淘汰 ≠ 删除后当新请求执行**：旧标识转为墓碑，之后再提交一律
+  返回 `result_expired`（HTTP **410 Gone**），提示调用方换新标识；只有墓碑
+  保护期也过去后，标识才彻底按“不存在”处理。
+- **LRU 保护**：处理中（INFLIGHT）、仍有并发等待者、刚被访问（提交或查询会
+  刷新 LRU 位置）的结论不会被淘汰。
+- **并发一致**：淘汰、超期清扫与并发重放在同一把锁内裁决，同一标识任何时刻
+  最多对应一份结论；压力测试（容量 50、60 个标识、每个 4 并发）验证零重复
+  副作用，存活键全部回放原结果。
+- 清扫在结论落定和访问时顺带触发（摊销成本），也可显式调用 `store.sweep()`
+  交给后台周期任务。
+
+## 6. 写入策略与热更新
+
+`WritePolicyRule(tenant_id, api, require_idempotency_key, degrade_mode)` 按
+租户×接口配置；`degrade_mode=None` 时取全局 `GovernanceConfig.degrade_mode`
+（默认 `FAIL_CLOSED`）。
+
+通过 `PolicyRegistry.update(new_config)` 即可 **不重启** 调整策略。注册表返回
+不可变快照：每个请求在判定链入口取一次快照，整次请求（以及该请求触发的配额
+降级裁决）都基于同一版本——策略更新只影响更新之后进入的请求，已在处理中的
+请求继续使用旧快照，因此同一批并发不会出现新旧策略混判。
+
+## 7. 降级策略（存储故障时）
+
+| 策略 | 配额闸门 | 结算闸门 |
+| --- | --- | --- |
+| `FAIL_CLOSED`（默认） | 拒绝 → 503 `dependency_unavailable` | 拒绝 → 503 |
+| `FAIL_OPEN` | 放行配额闸门 | **仍然拒绝**（绝不放开） |
+| `USE_CACHE` | 用最近已知窗口计数：未达上限放行，否则/冷缓存拒绝 | 拒绝 → 503 |
+
+关键安全边界：**即使配置为 FAIL_OPEN，放开的也只是配额闸门**。结算存储无法
+占位或无法确认首请求结论时一律保守拒绝，因此放行配置永远不会把重复副作用放
+过去（`test_fail_open_degrade_never_allows_duplicate_side_effect` 覆盖）。
+
+当副作用已经执行、但结论无法向调用方落定（如 complete 写失败）时，记录进入
+**UNCERTAIN** 状态：重复提交被拒（避免第二次副作用），调用方应凭同一标识
+查询，而不是重试。
+
+## 8. 提交结论只读查询
+
+`GET /submissions/{key}?api=/orders`（携带调用方凭据），由
+`GovernanceMiddleware.query_settlement` 提供，**只读、不产生副作用、不占
+额度**，并严格按租户隔离：一个租户的凭据查不到另一个租户同标识的结论；无
+凭据 → 401。
+
+| 返回 `status` | 含义 |
+| --- | --- |
+| `inflight` | 首请求仍在处理中 |
+| `completed` | 已完成，`data` 为首次结论（逐字节一致） |
+| `expired_or_not_found` | 结论已过期/被淘汰，或该租户下不存在此标识 |
+| `uncertain` | 副作用可能已发生，但结论暂时无法确认（请勿重试，稍后再查） |
+
+## 9. 失败原因与 HTTP 映射
 
 | `DenyReason` | HTTP | 含义 |
 | --- | --- | --- |
 | `missing_identity` | 401 | 凭据缺失/无效，无法解析租户 |
 | `access_denied` | 403 | 已识别身份但越权访问接口 |
-| `quota_exhausted` | 429 | 租户×接口当前窗口配额耗尽 |
-| `idempotency_conflict` | 409 | 同一幂等键携带了语义不同的载荷 |
-| `dependency_unavailable` | 503 | 底层依赖故障，按降级策略拒绝（不暴露细节） |
+| `quota_exhausted` | 429 | 租户×接口当前窗口配额耗尽（仅针对新提交标识） |
+| `missing_idempotency_key` | **428** | 接口强制要求提交标识，但请求未携带 |
+| `idempotency_conflict` | 409 | 同一提交标识携带了语义不同的载荷 |
+| `result_expired` | **410** | 结论已过期/被淘汰，须换新标识重新提交 |
+| `dependency_unavailable` | 503 | 依赖故障保守拒绝；或副作用已发生但结论暂不可确认 |
 
 响应体统一为 `{"error": "<reason>", "message": "<可解释说明>"}`。
 
-## 7. 本地验证
+## 10. 兼容范围
+
+- 治理层对外仍通过 `GovernanceMiddleware.handle(credentials, api,
+  idempotency_key, payload, action)` 编排；旧调用点无需修改。
+- `QuotaEnforcer` 既可接收静态 `GovernanceConfig`，也可接收 `PolicyRegistry`；
+  未显式传入策略注册表时中间件自动复用配额判定器的配置来源。
+- 内存结算存储的键由“仅提交标识”变为“(租户, 提交标识)”，跨租户彻底隔离；
+  直接操作存储内部字典的工具应改用新的 `reset()` 方法。
+- 主要行为差异：**同标识重试不再占用配额**；新增 428 / 410 两类拒绝；
+  结算记录不再无限增长（默认 24h + 每租户 1 万条）。
+- 内存实现适合单实例演示与测试；分布式部署应把 `IdempotencyStore` /
+  `QuotaStore` 换成 Redis 等满足相同协议与原子性保证的实现。
+
+## 11. 本地验证
 
 前置：Python 3.14+、[uv](https://docs.astral.sh/uv/)。
 
 ```bash
-# 安装依赖（含 pytest 开发依赖）
 uv sync
 
-# 运行全部测试；-s 打印治理日志（含 idempotency_key / tenant / basis）
+# 全部测试（59 个）；-s 打印治理日志（含 idempotency_key / tenant / basis）
 uv run python -m pytest -s
 
-# 只看某类场景
-uv run python -m pytest tests/test_quota.py        # 跨窗口、并发不超卖、降级
-uv run python -m pytest tests/test_idempotency.py  # 并发重复、载荷冲突、失败重试
+# 只看新行为
+uv run python -m pytest tests/test_retry_settlement.py  # 重试结算、策略热更新、降级一致
+uv run python -m pytest tests/test_retention_query.py   # TTL/LRU 淘汰、查询状态与租户隔离
+uv run python -m pytest tests/test_api_retry.py         # 428/410/查询端点的 HTTP 行为
 
 # 启动示例服务
 uv run fastapi dev main.py
 ```
 
-手工验证（服务启动后）：
+手工验证：
 
 ```bash
-# 正常下单 + 同键重复提交（只创建一个订单，返回相同 order_id）
-curl -s -X POST localhost:8000/orders \
-  -H 'X-Auth-Token: token-t1' -H 'X-Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' -d '{"item":"book"}'
-curl -s -X POST localhost:8000/orders \
-  -H 'X-Auth-Token: token-t1' -H 'X-Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' -d '{"item":"book"}'
+# 强制标识接口缺标识 -> 428 missing_idempotency_key
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/payments \
+  -H 'X-Auth-Token: token-t1' -H 'Content-Type: application/json' -d '{"item":"x"}'
 
-# 同键不同载荷 -> 409 idempotency_conflict
-curl -s -X POST localhost:8000/orders \
-  -H 'X-Auth-Token: token-t1' -H 'X-Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' -d '{"item":"phone"}'
+# 正常下单 + 同键重复提交（一个订单、相同 order_id、第二次不占额度）
+curl -s -X POST localhost:8000/orders -H 'X-Auth-Token: token-t1' \
+  -H 'X-Idempotency-Key: demo-1' -d '{"item":"book"}'
+curl -s -X POST localhost:8000/orders -H 'X-Auth-Token: token-t1' \
+  -H 'X-Idempotency-Key: demo-1' -d '{"item":"book"}'
 
-# 无凭据 -> 401；越权（token-t3 无 /orders 权限）-> 403；
-# token-t2 连续 3 次不同键下单 -> 第 3 次 429 quota_exhausted
+# 凭提交标识只读查询（按凭据的租户隔离）
+curl -s localhost:8000/submissions/demo-1 -H 'X-Auth-Token: token-t1'
+
+# 同键不同载荷 -> 409；token-t3 越权 -> 403
 ```
 
 示例凭据：`token-t1`（租户 t1，每分钟 3 次）、`token-t2`（t2，每分钟 2 次）、
-`token-t3`（t3，仅有 `/health` 权限，用于验证越权拒绝）。
+`token-t3`（t3，仅 `/health`）。`/orders` 默认不强制标识，`/payments` 强制
+要求 `X-Idempotency-Key`。
 
-## 8. 日志可解释性
+## 12. 日志可解释性
 
-每条治理判定都打印结构化字段，单测日志中可直接核对：
+每条治理判定都打印结构化字段（幂等键、租户、`decision`、`basis`），例如：
 
 ```
-governance.idempotency idempotency_key=log-key tenant=t-log decision=execute basis=first_submission
-governance.idempotency idempotency_key=log-key tenant=t-log decision=replay  basis=duplicate_after_completion
-governance.quota tenant=t1 api=/orders window=16 used=2 limit=3 decision=deny basis=quota_exhausted
-governance.quota tenant=t1 api=/orders decision=deny basis=degrade_fail_closed error=...
+governance.idempotency idempotency_key=k tenant=t1 decision=execute  basis=first_submission
+governance.idempotency idempotency_key=k tenant=t1 decision=replay   basis=duplicate_after_completion
+governance.idempotency idempotency_key=k tenant=t1 decision=evict    basis=capacity_lru
+governance.idempotency idempotency_key=k tenant=t1 decision=expire   basis=retention_ttl
+governance.quota tenant=t1 api=/orders window=16 decision=deny basis=quota_exhausted
 ```
-
-`basis` 给出判定依据（首提交 / 重复回放 / 并发跟随 / 配额授予或耗尽 /
-具体降级模式），`tenant`、`idempotency_key` 标识请求归属。
