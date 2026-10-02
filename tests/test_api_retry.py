@@ -102,3 +102,50 @@ def test_expired_submission_is_410(monkeypatch: pytest.MonkeyPatch) -> None:
     assert r.status_code == 410
     assert r.json()["error"] == "result_expired"
     assert app_module.orders.created == created_before, "过期重放不得二次执行"
+
+
+def test_quota_denied_retry_replays_same_429(client: TestClient) -> None:
+    """首次额度拒绝（429）后同标识重试：回放同一拒绝结论，可查询 denied。"""
+    h = lambda key: {"X-Auth-Token": "token-t2", "X-Idempotency-Key": key}
+    assert client.post("/orders", json={"item": "a"}, headers=h("q-a")).status_code == 200
+    assert client.post("/orders", json={"item": "b"}, headers=h("q-b")).status_code == 200
+    # t2 每窗口 2 个额度已用完：新键首次提交被 429。
+    r1 = client.post("/orders", json={"item": "c"}, headers=h("q-c"))
+    assert r1.status_code == 429
+    assert r1.json()["error"] == "quota_exhausted"
+    created = app_module.orders.created
+    # 断线重连再试：与第一次完全一样的结论，不产生副作用、不再占额度。
+    r2 = client.post("/orders", json={"item": "c"}, headers=h("q-c"))
+    assert r2.status_code == 429
+    assert r2.json() == r1.json()
+    assert app_module.orders.created == created
+    # 被拒结论可只读查询。
+    q = client.get("/submissions/q-c", headers={"X-Auth-Token": "token-t2"})
+    assert q.json()["status"] == "denied"
+    assert q.json()["data"]["reason"] == "quota_exhausted"
+
+
+def test_retention_hot_update_via_api(client: TestClient) -> None:
+    """PUT /governance/retention：运行中调小容量上限立即生效，无需重启。"""
+    h = lambda key: {"X-Auth-Token": "token-t1", "X-Idempotency-Key": key}
+    assert client.post("/orders", json={"item": "a"}, headers=h("h-1")).status_code == 200
+    assert client.post("/orders", json={"item": "b"}, headers=h("h-2")).status_code == 200
+
+    # 未认证不得调整。
+    assert client.put("/governance/retention",
+                      json={"max_completed_records": 1}).status_code == 401
+
+    # 调小容量到 1：最久未访问的 h-1 立即被淘汰，h-2 保留。
+    r = client.put("/governance/retention",
+                   json={"max_completed_records": 1},
+                   headers={"X-Auth-Token": "token-t1"})
+    assert r.status_code == 200
+    assert r.json()["retention"]["max_completed_records"] == 1
+    q1 = client.get("/submissions/h-1", headers={"X-Auth-Token": "token-t1"})
+    assert q1.json()["status"] == "expired_or_not_found"
+    q2 = client.get("/submissions/h-2", headers={"X-Auth-Token": "token-t1"})
+    assert q2.json()["status"] == "completed"
+
+    # 被淘汰标识再提交：410 而非二次执行。
+    r3 = client.post("/orders", json={"item": "a"}, headers=h("h-1"))
+    assert r3.status_code == 410
