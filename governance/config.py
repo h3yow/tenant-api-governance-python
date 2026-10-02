@@ -53,11 +53,16 @@ class WritePolicyRule:
 class RetentionConfig:
     """已完成提交结论的保留与淘汰规则。
 
-    - ``result_ttl_seconds``：已完成结论的保留时长；None 表示不按时间过期。
+    - ``result_ttl_seconds``：已完成/已拒绝结论的保留时长，按 **最近一次访问**
+      （落定、重放、查询都会刷新）滑动计算；None 表示不按时间过期。
     - ``max_completed_records``：每租户已完成结论的容量上限；None 表示不限。
       超容量时按 LRU 淘汰最久未访问的 *已完成* 结论（处理中、刚访问的不淘汰）。
     - ``tombstone_ttl_seconds``：被过期/淘汰的旧标识以“墓碑”形式继续挡住
       静默重放的保留时长；超期后标识彻底消失（按不存在处理，调用方应换新标识）。
+
+    结算存储每次判定都实时读取当前配置（见
+    ``InMemoryIdempotencyStore(retention_provider=...)``），因此运行中调整
+    立即对后续请求生效。
     """
 
     result_ttl_seconds: float | None = 86400.0

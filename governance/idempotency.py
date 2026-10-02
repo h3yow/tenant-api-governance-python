@@ -7,15 +7,20 @@
    且 **重复请求不占配额**——即使额度已耗尽或重试落在新时间窗口，也返回
    首次结论。只有真正第一次出现的写请求才占用额度（由 leader 占位后调用
    ``reserve_quota``）。全新的提交标识在额度耗尽时仍照常被配额拒绝。
-2. 同键携带语义不同的载荷（规范化哈希不同）立即拒绝
+2. 首次请求若被治理闸门拒绝（如额度耗尽、依赖故障保守拒绝），该拒绝本身
+   也被落定为结论（REJECTED）：同标识之后无论并发重试、断线重连、跨窗口
+   还是额度恢复，都回放 *同一份* 拒绝，绝不当作新请求再执行、再扣额度；
+   只有真正没见过的全新标识才照常走配额判定。
+3. 同键携带语义不同的载荷（规范化哈希不同）立即拒绝
    （IDEMPOTENCY_CONFLICT），不会静默回放。
-3. 结论保留有时长与容量上限：超期或被 LRU 淘汰的旧标识进入“墓碑”，
-   再被提交时明确返回 RESULT_EXPIRED（要求换新标识），绝不静默当新请求
-   执行第二遍。处理中、正在被等待或刚被访问的结论不会被淘汰；同一标识
-   在任何时刻最多对应一份结论。
-4. 依赖恢复后可凭提交标识只读查询（不产生副作用、不占额度），区分：
-   处理中 / 已完成 / 已过期或不存在 / 副作用已发生但结论暂不可确认。
-5. 存储故障映射为 DEPENDENCY_UNAVAILABLE，底层异常不透出；放行降级
+4. 结论保留有时长与容量上限，且 **运行中调整立即生效**（每次判定在锁内
+   取当前配置）：超期或被 LRU 淘汰的旧标识进入“墓碑”，再被提交时明确返回
+   RESULT_EXPIRED（要求换新标识），绝不静默当新请求执行第二遍。过期按
+   “最近一次访问”滑动计算：处理中、正在被等待或刚被提交/查询过的结论不
+   会被误清；同一标识在任何时刻最多对应一份结论。
+5. 依赖恢复后可凭提交标识只读查询（不产生副作用、不占额度），区分：
+   处理中 / 已完成 / 已拒绝 / 已过期或不存在 / 副作用已发生但结论暂不可确认。
+6. 存储故障映射为 DEPENDENCY_UNAVAILABLE，底层异常不透出；放行降级
    （FAIL_OPEN）只放开配额闸门，结算闸门永远保守，绝不放过重复副作用。
 """
 
@@ -46,6 +51,7 @@ class IdemStatus(str, Enum):
     COMPLETED = "completed"        # 副作用已落定，结论可回放
     FAILED = "failed"              # 首请求业务失败（占位随即释放，允许重试）
     UNCERTAIN = "uncertain"        # 副作用可能已发生，但结论无法确认
+    REJECTED = "rejected"          # 首请求被治理闸门（如额度）拒绝，拒绝即结论
 
 
 class AcquireOutcome(str, Enum):
@@ -59,6 +65,7 @@ class QueryStatus(str, Enum):
     COMPLETED = "completed"
     EXPIRED_OR_NOT_FOUND = "expired_or_not_found"
     UNCERTAIN = "uncertain"
+    REJECTED = "rejected"          # 首请求被治理闸门拒绝（如额度耗尽），重试回放同一拒绝
 
 
 @dataclass
@@ -70,6 +77,9 @@ class IdemRecord:
     result: Any = None
     completed_at: float | None = None
     last_accessed_at: float | None = None
+    # 首请求被治理闸门拒绝时落定的拒绝结论（REJECTED 时填充，重试原样回放）
+    deny_reason: DenyReason | None = None
+    deny_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +110,9 @@ class IdempotencyStore(Protocol):
         ...
 
     def complete(self, tenant_id: str, key: str, result: Any) -> None: ...
+    def complete_rejection(
+        self, tenant_id: str, key: str, reason: DenyReason, message: str
+    ) -> None: ...
     def fail(self, tenant_id: str, key: str) -> None: ...
     def release(self, tenant_id: str, key: str) -> None: ...
     def mark_uncertain(self, tenant_id: str, key: str) -> None: ...
@@ -124,8 +137,13 @@ class InMemoryIdempotencyStore:
         self,
         retention: RetentionConfig | None = None,
         clock: Callable[[], float] = time.time,
+        retention_provider: Callable[[], RetentionConfig] | None = None,
     ) -> None:
-        self._retention = retention or RetentionConfig()
+        # 保留配置支持运行中调整：传入 retention_provider 时，每次判定都在
+        # 锁内取一次当前值——配置更新后进入的请求统一按新值裁决，单次操作
+        # 内部也不会混用新旧两份配置。
+        self._static_retention = retention or RetentionConfig()
+        self._retention_provider = retention_provider
         self._clock = clock
         self._lock = threading.Lock()
         self._conditions: dict[_StorageKey, threading.Condition] = {}
@@ -135,10 +153,28 @@ class InMemoryIdempotencyStore:
         self._tombstones: dict[_StorageKey, float] = {}
         # 每租户已完成结论的访问顺序（LRU，front 最久未访问）
         self._tenant_lru: dict[str, OrderedDict[str, None]] = {}
-        # 每租户完成时间队列 (completed_at, key)：按完成顺序做 TTL 清扫
-        self._completion: dict[str, deque[tuple[float, str]]] = {}
+        # 每租户过期标记队列 (last_accessed_at, key)：按最近访问时间做 TTL 清扫
+        self._expiry: dict[str, deque[tuple[float, str]]] = {}
 
     # ---- 内部工具（均在持锁时调用） ----
+
+    def _retention_locked(self) -> RetentionConfig:
+        """取当前生效的保留配置（每次判定取一次，保证单次判定内一致）。"""
+        provider = self._retention_provider
+        if provider is not None:
+            return provider()
+        return self._static_retention
+
+    def _touch_locked(
+        self, skey: _StorageKey, record: IdemRecord, now: float
+    ) -> None:
+        """记录一次访问：刷新 LRU 位置并登记过期标记（滑动过期基准）。"""
+        tenant_id, key = skey
+        record.last_accessed_at = now
+        lru = self._tenant_lru.get(tenant_id)
+        if lru is not None and key in lru:
+            lru.move_to_end(key)
+        self._expiry.setdefault(tenant_id, deque()).append((now, key))
 
     def _cond(self, skey: _StorageKey) -> threading.Condition:
         cv = self._conditions.get(skey)
@@ -168,7 +204,8 @@ class InMemoryIdempotencyStore:
         lru = self._tenant_lru.get(tenant_id)
         if lru is not None:
             lru.pop(key, None)
-        self._tombstones[skey] = now + self._retention.tombstone_ttl_seconds
+        ttl = self._retention_locked().tombstone_ttl_seconds
+        self._tombstones[skey] = now + ttl
         self._cond(skey).notify_all()
 
     def _evict_if_needed_locked(
@@ -179,7 +216,7 @@ class InMemoryIdempotencyStore:
         处理中、仍有并发等待者的记录跳过；被淘汰者转为墓碑而不是直接删除，
         从而对随后到达的同标识重试给出明确的 RESULT_EXPIRED。
         """
-        cap = self._retention.max_completed_records
+        cap = self._retention_locked().max_completed_records
         if cap is None:
             return
         lru = self._tenant_lru.get(tenant_id)
@@ -190,7 +227,7 @@ class InMemoryIdempotencyStore:
                 rec = self._records.get(skey)
                 if (
                     rec is not None
-                    and rec.status is IdemStatus.COMPLETED
+                    and rec.status in (IdemStatus.COMPLETED, IdemStatus.REJECTED)
                     and self._waiters.get(skey, 0) == 0
                 ):
                     victim = candidate
@@ -205,28 +242,36 @@ class InMemoryIdempotencyStore:
             self._tombstone_locked((tenant_id, victim), now)
 
     def _sweep_ttl_locked(self, now: float) -> None:
-        """按完成时间顺序把超期结论转为墓碑，并清掉过了保护期的墓碑。"""
-        ttl = self._retention.result_ttl_seconds
+        """按最近访问时间把超期结论转为墓碑，并清掉过了保护期的墓碑。
+
+        过期基准是“最近一次访问”（落定/重放/查询都会刷新），因此刚被提交
+        或查询过的结论不会被误清；处理中、仍有等待者的记录同样保留。
+        """
+        ttl = self._retention_locked().result_ttl_seconds
         if ttl is not None:
-            for tenant_id, queue in self._completion.items():
+            for tenant_id, queue in self._expiry.items():
                 while queue:
-                    completed_at, key = queue[0]
-                    if completed_at + ttl > now:
+                    accessed_at, key = queue[0]
+                    if accessed_at + ttl > now:
                         break
                     queue.popleft()
                     skey = (tenant_id, key)
                     rec = self._records.get(skey)
-                    if (
-                        rec is not None
-                        and rec.status is IdemStatus.COMPLETED
-                        and rec.completed_at == completed_at
-                        and self._waiters.get(skey, 0) == 0
+                    if rec is None or rec.last_accessed_at != accessed_at:
+                        continue  # 已有更新的访问标记在队列中，本条作废
+                    if rec.status not in (
+                        IdemStatus.COMPLETED, IdemStatus.REJECTED
                     ):
-                        logger.info(
-                            "idempotency_key=%s tenant=%s decision=expire "
-                            "basis=retention_ttl", key, tenant_id,
-                        )
-                        self._tombstone_locked(skey, now)
+                        continue
+                    if self._waiters.get(skey, 0) > 0:
+                        # 有并发等待者：保留并重新登记，等待者散去后再到期
+                        queue.append((accessed_at, key))
+                        continue
+                    logger.info(
+                        "idempotency_key=%s tenant=%s decision=expire "
+                        "basis=retention_ttl", key, tenant_id,
+                    )
+                    self._tombstone_locked(skey, now)
         for skey, until in list(self._tombstones.items()):
             if until <= now:
                 self._tombstones.pop(skey, None)
@@ -239,7 +284,10 @@ class InMemoryIdempotencyStore:
         skey = (tenant_id, key)
         with self._lock:
             now = self._clock()
+            retention = self._retention_locked()
             self._sweep_ttl_locked(now)
+            # 容量上限运行中调小后，对后续请求立即生效（淘汰转墓碑而非删除）
+            self._evict_if_needed_locked(tenant_id, now)
             if self._expire_tombstone_locked(skey, now):
                 raise GovernanceError(
                     DenyReason.RESULT_EXPIRED,
@@ -261,10 +309,10 @@ class InMemoryIdempotencyStore:
                     "请勿重复提交，请稍后凭同一提交标识查询",
                 )
             if (
-                existing.status is IdemStatus.COMPLETED
-                and existing.completed_at is not None
-                and self._retention.result_ttl_seconds is not None
-                and existing.completed_at + self._retention.result_ttl_seconds <= now
+                existing.status in (IdemStatus.COMPLETED, IdemStatus.REJECTED)
+                and existing.last_accessed_at is not None
+                and retention.result_ttl_seconds is not None
+                and existing.last_accessed_at + retention.result_ttl_seconds <= now
                 and self._waiters.get(skey, 0) == 0
             ):
                 logger.info(
@@ -283,10 +331,9 @@ class InMemoryIdempotencyStore:
                     f"提交标识 {key!r} 已携带不同载荷提交，拒绝语义冲突的请求",
                 )
             existing.last_accessed_at = now
-            if existing.status is IdemStatus.COMPLETED:
-                lru = self._tenant_lru.get(tenant_id)
-                if lru is not None and key in lru:
-                    lru.move_to_end(key)
+            if existing.status in (IdemStatus.COMPLETED, IdemStatus.REJECTED):
+                # 已完成/已拒绝结论：本次访问刷新 LRU 与滑动过期基准
+                self._touch_locked(skey, existing, now)
                 return existing, AcquireOutcome.REPLAY
             return existing, AcquireOutcome.INFLIGHT
 
@@ -298,11 +345,36 @@ class InMemoryIdempotencyStore:
             record.status = IdemStatus.COMPLETED
             record.result = result
             record.completed_at = now
-            record.last_accessed_at = now
             lru = self._tenant_lru.setdefault(tenant_id, OrderedDict())
             lru[key] = None
             lru.move_to_end(key)
-            self._completion.setdefault(tenant_id, deque()).append((now, key))
+            self._touch_locked(skey, record, now)
+            self._sweep_ttl_locked(now)
+            self._evict_if_needed_locked(tenant_id, now)
+            self._cond(skey).notify_all()
+
+    def complete_rejection(
+        self, tenant_id: str, key: str, reason: DenyReason, message: str
+    ) -> None:
+        """把治理闸门的拒绝（如额度耗尽）落定为该标识的结论。
+
+        落定后同标识的任何重试（并发、断线重连、跨窗口、额度恢复）都回放
+        同一拒绝，绝不当作新请求再执行；与已完成结论一样参与 TTL/容量淘汰。
+        """
+        skey = (tenant_id, key)
+        with self._lock:
+            now = self._clock()
+            record = self._records.get(skey)
+            if record is None:
+                return
+            record.status = IdemStatus.REJECTED
+            record.deny_reason = reason
+            record.deny_message = message
+            record.completed_at = now
+            lru = self._tenant_lru.setdefault(tenant_id, OrderedDict())
+            lru[key] = None
+            lru.move_to_end(key)
+            self._touch_locked(skey, record, now)
             self._sweep_ttl_locked(now)
             self._evict_if_needed_locked(tenant_id, now)
             self._cond(skey).notify_all()
@@ -363,6 +435,7 @@ class InMemoryIdempotencyStore:
         with self._lock:
             now = self._clock()
             self._sweep_ttl_locked(now)
+            self._evict_if_needed_locked(tenant_id, now)
             if self._expire_tombstone_locked(skey, now):
                 return QueryOutcome(QueryStatus.EXPIRED_OR_NOT_FOUND)
             record = self._records.get(skey)
@@ -374,11 +447,12 @@ class InMemoryIdempotencyStore:
                 return QueryOutcome(QueryStatus.UNCERTAIN)
             if record.status is IdemStatus.FAILED:
                 return QueryOutcome(QueryStatus.EXPIRED_OR_NOT_FOUND)
+            if record.status is IdemStatus.REJECTED:
+                # 查询也算一次访问，刷新 LRU 与滑动过期基准（无业务副作用）。
+                self._touch_locked(skey, record, now)
+                return QueryOutcome(QueryStatus.REJECTED)
             # COMPLETED：查询也算一次访问，刷新 LRU 位置（无业务副作用）。
-            record.last_accessed_at = now
-            lru = self._tenant_lru.get(tenant_id)
-            if lru is not None and key in lru:
-                lru.move_to_end(key)
+            self._touch_locked(skey, record, now)
             return QueryOutcome(QueryStatus.COMPLETED, record.result)
 
     def sweep(self) -> None:
@@ -393,7 +467,7 @@ class InMemoryIdempotencyStore:
             self._records.clear()
             self._tombstones.clear()
             self._tenant_lru.clear()
-            self._completion.clear()
+            self._expiry.clear()
 
 
 class FailingIdempotencyStore:
@@ -403,6 +477,9 @@ class FailingIdempotencyStore:
         raise StoreUnavailable("idempotency backend unavailable")
 
     def complete(self, tenant_id, key, result):
+        raise StoreUnavailable("idempotency backend unavailable")
+
+    def complete_rejection(self, tenant_id, key, reason, message):
         raise StoreUnavailable("idempotency backend unavailable")
 
     def fail(self, tenant_id, key): ...
@@ -494,6 +571,15 @@ class IdempotencyService:
             ) from exc
 
         if outcome is AcquireOutcome.REPLAY:
+            if record.status is IdemStatus.REJECTED:
+                # 首请求被治理闸门拒绝的结论：原样回放同一拒绝，不重新判定。
+                logger.info("idempotency_key=%s tenant=%s decision=replay "
+                            "basis=replay_rejection reason=%s",
+                            key, tenant_id, record.deny_reason)
+                raise GovernanceError(
+                    record.deny_reason or DenyReason.DEPENDENCY_UNAVAILABLE,
+                    record.deny_message or "该提交已被拒绝，请勿重复提交",
+                )
             logger.info("idempotency_key=%s tenant=%s decision=replay "
                         "basis=duplicate_after_completion", key, tenant_id)
             return record.result
@@ -522,20 +608,25 @@ class IdempotencyService:
         action: Callable[[], Any],
         reserve_quota: Callable[[], None] | None,
     ) -> Any:
-        # 只有真正的首个写请求才占用额度；额度拒绝时释放占位，允许稍后重试。
+        # 只有真正的首个写请求才占用额度；额度等治理闸门的拒绝会被落定为
+        # 该标识的结论：同标识重试（并发/断线重连/跨窗口/额度恢复）一律回放
+        # 同一拒绝，绝不当作新请求再执行、再扣额度或再产生副作用。
         if reserve_quota is not None:
             try:
                 reserve_quota()
-            except GovernanceError:
+            except GovernanceError as exc:
                 try:
-                    self._store.release(tenant_id, key)
-                except StoreUnavailable as exc:
-                    logger.error(
-                        "idempotency_key=%s tenant=%s release_after_quota_deny "
-                        "failed error=%s", key, tenant_id, exc,
+                    self._store.complete_rejection(
+                        tenant_id, key, exc.reason, exc.message
                     )
-                logger.info("idempotency_key=%s tenant=%s decision=release "
-                            "basis=quota_denied", key, tenant_id)
+                except StoreUnavailable as store_exc:
+                    logger.error(
+                        "idempotency_key=%s tenant=%s record_rejection "
+                        "failed error=%s", key, tenant_id, store_exc,
+                    )
+                logger.info("idempotency_key=%s tenant=%s decision=reject "
+                            "basis=governance_gate_denied reason=%s",
+                            key, tenant_id, exc.reason)
                 raise
         logger.info("idempotency_key=%s tenant=%s decision=execute "
                     "basis=first_submission", key, tenant_id)
@@ -591,6 +682,15 @@ class IdempotencyService:
             raise GovernanceError(
                 DenyReason.DEPENDENCY_UNAVAILABLE,
                 "首次提交执行失败，请凭同一提交标识重试",
+            )
+        if settled.status is IdemStatus.REJECTED:
+            # 与首请求同时到达的并发重试：回放同一份治理拒绝结论。
+            logger.info("idempotency_key=%s tenant=%s decision=replay "
+                        "basis=concurrent_rejection reason=%s",
+                        key, tenant_id, settled.deny_reason)
+            raise GovernanceError(
+                settled.deny_reason or DenyReason.DEPENDENCY_UNAVAILABLE,
+                settled.deny_message or "该提交已被拒绝，请勿重复提交",
             )
         if settled.status is IdemStatus.UNCERTAIN:
             logger.info("idempotency_key=%s tenant=%s decision=deny "

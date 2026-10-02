@@ -71,7 +71,11 @@ IDENTITY = IdentityResolver(
     }
 )
 
-IDEMPOTENCY_STORE = InMemoryIdempotencyStore(retention=CONFIG.retention)
+# 结算存储的保留配置（TTL/容量/墓碑）通过 provider 实时取自策略注册表：
+# POLICIES.update() 后无需重启，后续请求的保留判定立即按新配置执行。
+IDEMPOTENCY_STORE = InMemoryIdempotencyStore(
+    retention_provider=lambda: POLICIES.get().retention,
+)
 IDEMPOTENCY = IdempotencyService(IDEMPOTENCY_STORE)
 QUOTA = QuotaEnforcer(POLICIES, InMemoryQuotaStore())
 GOVERNANCE = GovernanceMiddleware(IDENTITY, QUOTA, IDEMPOTENCY, POLICIES)

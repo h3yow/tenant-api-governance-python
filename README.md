@@ -5,10 +5,14 @@
 - 并发请求：配额不会超卖、计数不会错乱；
 - 重复提交 / 断线重连 / 重试风暴：同一提交标识只产生一次业务副作用，
   永远返回首次结论，且 **重试不再占额度**（即使额度已耗尽或已跨时间窗口）；
+- 首次被治理闸门拒绝（如额度耗尽）：拒绝本身也被落定为结论，同标识之后
+  无论并发重试、断线重连、跨窗口还是额度恢复，都回放 **同一份拒绝**，
+  绝不当作新请求再执行、再扣额度；
 - 依赖异常 / 策略调整：降级策略可按租户×接口配置并热更新，并发下裁决一致，
   底层错误不透出给调用方；
 - 结论可查询、可淘汰：依赖恢复后可凭提交标识只读查询处理结论；结论保留有
-  时长与容量上限，过期/被淘汰的旧标识被明确拒绝，绝不静默二次执行。
+  时长与容量上限，**运行中调整立即生效**，过期/被淘汰的旧标识被明确拒绝，
+  绝不静默二次执行。
 
 ## 1. 模块结构
 
@@ -21,7 +25,7 @@ governance/
   idempotency.py  # 结算存储：占位/等待/落定、TTL+LRU 保留、墓碑、只读查询
   middleware.py   # 判定链编排：身份 -> 权限 -> 策略快照 -> 结算（内含配额）
 main.py           # FastAPI 示例：订单/支付接口 + 提交结论查询 + HTTP 映射
-tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故障、过期淘汰）
+tests/            # 68 个单测/集成测试（并发、跨窗口、依赖故障、过期淘汰、保留热调）
 ```
 
 ## 2. 判定链（顺序确定）
@@ -35,6 +39,8 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
    - 同标识重试/并发/断线重连 → 回放首次结论，**不占额度、不产生副作用**；
    - 仅真正第一次出现的写请求才占用配额：耗尽 → `quota_exhausted`（429），
      全新的提交标识在额度用完时仍照常被拒绝；
+   - 首次被治理闸门拒绝（额度耗尽、依赖故障保守拒绝）→ 拒绝落定为该标识的
+     结论，同标识重试一律回放同一份拒绝（见第 3 节）；
    - 同键不同载荷 → `idempotency_conflict`（409）；
    - 结论已过期/被淘汰 → `result_expired`（**410**），要求换新标识；
    - 结算存储故障 / 副作用已发生但结论无法确认 → `dependency_unavailable`（503）。
@@ -48,6 +54,14 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 - **额度耗尽后的重试**：首次请求已落定，之后即使该租户该接口额度已经用完，
   同标识重试仍返回首次结论（而不是 429）；但 **全新的提交标识** 仍被 429
   正常拒绝。
+- **首次被拒（含额度拒绝）后的重试**：首次提交若被治理闸门拒绝（额度耗尽
+  → 429，或依赖故障保守拒绝 → 503），该拒绝会被 **落定为该提交标识的结论**
+  （REJECTED）。之后同标识的任何重试——一批并发一起重试、断线重连、跨到
+  下一个时间窗口、甚至额度后来有了空余——都回放 **同一份拒绝结论**，不会
+  出现同一批里有的 429、有的 503 的前后不一致，也绝不会把这次重试当成全新
+  请求再执行一遍、再扣一次额度或再产生一次业务副作用。只有真正没见过的全新
+  标识才照常走配额判定。被拒结论与已完成结论一样参与保留时长与容量淘汰，
+  超期/被淘汰后同样转为墓碑（再提交 → 410）。
 - **跨时间窗口的重试**：首次提交与重试落在不同窗口时，重试回放首次结论，
   **不占用新窗口的额度**；新窗口额度完整保留给真正的新请求。
 - **并发重复提交**：后到者在同键条件变量上等待，首请求落定后拿到同一个返回值，
@@ -57,8 +71,8 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
   JSON 键顺序不同但语义相同视为同一载荷（回放）。
 - **首次业务失败**：leader 标记 FAILED 并释放占位（无副作用），调用方可用
   同一键安全重试，重试成为新的 leader 并正常占额度。
-- **配额闸门在结算之后**：leader 占位成功后才调用配额占用；若占额度被拒，
-  占位立即释放，调用方稍后可用同一键重试。
+- **配额闸门在结算之后**：leader 占位成功后才调用配额占用；占额度被拒时
+  拒绝结论随即落定（见上），同标识重试一致回放该拒绝。
 
 ## 4. 无标识写入（X-Idempotency-Key 缺失）
 
@@ -82,7 +96,7 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
-| `result_ttl_seconds` | `86400`（24h） | 已完成结论的保留时长；`None` 表示不按时间过期 |
+| `result_ttl_seconds` | `86400`（24h） | 已完成/已拒绝结论的保留时长，按 **最近一次访问** 滑动计算；`None` 表示不按时间过期 |
 | `max_completed_records` | `10000` | 每租户已完成结论容量上限；超出按 LRU 淘汰；`None` 表示不限 |
 | `tombstone_ttl_seconds` | `86400`（24h） | 过期/被淘汰标识以“墓碑”继续挡住静默重放的时长 |
 
@@ -91,8 +105,16 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 - **超期或被淘汰 ≠ 删除后当新请求执行**：旧标识转为墓碑，之后再提交一律
   返回 `result_expired`（HTTP **410 Gone**），提示调用方换新标识；只有墓碑
   保护期也过去后，标识才彻底按“不存在”处理。
-- **LRU 保护**：处理中（INFLIGHT）、仍有并发等待者、刚被访问（提交或查询会
-  刷新 LRU 位置）的结论不会被淘汰。
+- **滑动过期与 LRU 保护**：过期基准是“最近一次访问”（落定、重放、查询都会
+  刷新），因此刚被提交或查询过的结论不会被误清；处理中（INFLIGHT）、仍有
+  并发等待者的结论同样不会被淘汰或清扫。
+- **运行中调整立即生效**：结算存储通过 `retention_provider` 在每次判定时
+  （锁内）读取当前 `RetentionConfig`——示例服务已将其接到
+  `PolicyRegistry`（`lambda: POLICIES.get().retention`），因此
+  `POLICIES.update()` 调小/调大 TTL 或容量上限后，**之后进入的请求立即按
+  新配置判定**；容量调小时下一次判定即按新上限淘汰。由于读取与判定在同一把
+  锁内完成，调整之后进入的一批并发请求统一按新配置裁决，不会一半按旧值、
+  一半按新值；单次判定内部也不混用新旧两份配置。
 - **并发一致**：淘汰、超期清扫与并发重放在同一把锁内裁决，同一标识任何时刻
   最多对应一份结论；压力测试（容量 50、60 个标识、每个 4 并发）验证零重复
   副作用，存活键全部回放原结果。
@@ -109,6 +131,11 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 不可变快照：每个请求在判定链入口取一次快照，整次请求（以及该请求触发的配额
 降级裁决）都基于同一版本——策略更新只影响更新之后进入的请求，已在处理中的
 请求继续使用旧快照，因此同一批并发不会出现新旧策略混判。
+
+保留配置（`GovernanceConfig.retention`：TTL / 容量上限 / 墓碑时长）同样随
+`PolicyRegistry.update()` 热更新：结算存储每次判定都在锁内实时读取当前值，
+调整后进入的请求立即按新保留策略判定（含容量调小后的即时淘汰），并发判定
+一致性保证与上文相同（见 5.2）。
 
 ## 7. 降级策略（存储故障时）
 
@@ -137,6 +164,7 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 | --- | --- |
 | `inflight` | 首请求仍在处理中 |
 | `completed` | 已完成，`data` 为首次结论（逐字节一致） |
+| `rejected` | 首请求被治理闸门拒绝（如额度耗尽），同标识重试将回放同一拒绝 |
 | `expired_or_not_found` | 结论已过期/被淘汰，或该租户下不存在此标识 |
 | `uncertain` | 副作用可能已发生，但结论暂时无法确认（请勿重试，稍后再查） |
 
@@ -163,7 +191,10 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 - 内存结算存储的键由“仅提交标识”变为“(租户, 提交标识)”，跨租户彻底隔离；
   直接操作存储内部字典的工具应改用新的 `reset()` 方法。
 - 主要行为差异：**同标识重试不再占用配额**；新增 428 / 410 两类拒绝；
-  结算记录不再无限增长（默认 24h + 每租户 1 万条）。
+  结算记录不再无限增长（默认 24h + 每租户 1 万条）；**首次被治理闸门拒绝
+  （如额度耗尽）的提交标识会落定拒绝结论，同标识重试一致回放该拒绝**；
+  结论过期按“最近一次访问”滑动计算（提交/重放/查询都会刷新），保留配置
+  运行中调整立即生效。
 - 内存实现适合单实例演示与测试；分布式部署应把 `IdempotencyStore` /
   `QuotaStore` 换成 Redis 等满足相同协议与原子性保证的实现。
 
@@ -174,10 +205,12 @@ tests/            # 59 个单测/集成测试（并发、跨窗口、依赖故�
 ```bash
 uv sync
 
-# 全部测试（59 个）；-s 打印治理日志（含 idempotency_key / tenant / basis）
+# 全部测试（68 个）；结尾按业务域汇总各用例通过情况，
+# -s 额外打印治理日志（含 idempotency_key / tenant / basis）与收集阶段的业务域覆盖
 uv run python -m pytest -s
 
 # 只看新行为
+uv run python -m pytest tests/test_retry_governance.py  # 拒绝回放、保留热调、边界并发
 uv run python -m pytest tests/test_retry_settlement.py  # 重试结算、策略热更新、降级一致
 uv run python -m pytest tests/test_retention_query.py   # TTL/LRU 淘汰、查询状态与租户隔离
 uv run python -m pytest tests/test_api_retry.py         # 428/410/查询端点的 HTTP 行为
@@ -216,7 +249,17 @@ curl -s localhost:8000/submissions/demo-1 -H 'X-Auth-Token: token-t1'
 ```
 governance.idempotency idempotency_key=k tenant=t1 decision=execute  basis=first_submission
 governance.idempotency idempotency_key=k tenant=t1 decision=replay   basis=duplicate_after_completion
+governance.idempotency idempotency_key=k tenant=t1 decision=reject   basis=governance_gate_denied reason=quota_exhausted
+governance.idempotency idempotency_key=k tenant=t1 decision=replay   basis=replay_rejection reason=quota_exhausted
 governance.idempotency idempotency_key=k tenant=t1 decision=evict    basis=capacity_lru
 governance.idempotency idempotency_key=k tenant=t1 decision=expire   basis=retention_ttl
 governance.quota tenant=t1 api=/orders window=16 decision=deny basis=quota_exhausted
+```
+
+测试运行结束会按业务域汇总用例通过情况（无需 `-s`），例如：
+
+```
+[重试治理增强（拒绝回放/保留热调/边界并发）] 9/9 通过
+  ✓ test_quota_denied_retry_replays_same_denial_across_windows PASSED
+  ...
 ```

@@ -38,13 +38,18 @@ def test_expired_key_is_rejected_not_silently_executed_again() -> None:
     svc.execute("k", "t1", {"v": 1}, lambda: effects.append(1))
     assert effects == [1]
 
-    # 保留期内：正常回放，不再产生副作用。
+    # 保留期内：正常回放，不再产生副作用；回放本身刷新“最近访问时间”。
     now[0] = 159.0
     svc.execute("k", "t1", {"v": 1}, lambda: effects.append(1))
     assert effects == [1]
 
-    # 超期后：明确的 RESULT_EXPIRED，绝不静默当新请求再执行一遍。
-    now[0] = 161.0
+    # 刚被访问过的结论不会被误清：过期按最近访问滑动（159 + 60）。
+    now[0] = 200.0
+    svc.execute("k", "t1", {"v": 1}, lambda: effects.append(1))
+    assert effects == [1]
+
+    # 滑动窗口也超期后：明确的 RESULT_EXPIRED，绝不静默当新请求再执行一遍。
+    now[0] = 261.0
     with pytest.raises(GovernanceError) as exc:
         svc.execute("k", "t1", {"v": 1}, lambda: effects.append(1))
     assert exc.value.reason is DenyReason.RESULT_EXPIRED
